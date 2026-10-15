@@ -1,0 +1,22 @@
+# nanovoice dictionary — edit freely; the server reloads this file when it changes.
+# terms:       proper nouns / jargon, passed to ASR as a prompt (earlier = higher priority)
+# corrections: fixed misrecognitions, replaced case-insensitively after ASR
+# ignore:      terms/corrections the learner must never (re-)add
+# Note: saving via the API or the learner rewrites this file (comments are not kept).
+
+terms = [
+  "Claude Code",
+  "Tailscale",
+  "MagicDNS",
+]
+
+ignore = [
+]
+
+[[corrections]]
+wrong = "cloud code"
+right = "Claude Code"
+
+[[corrections]]
+wrong = "tail scale"
+right = "Tailscale"

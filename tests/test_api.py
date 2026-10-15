@@ -184,12 +184,12 @@ def test_clean_opt_out_and_short_text(make_client, audio_dir):
 
 def test_vocabulary_prompt_and_replacements(make_client, audio_dir):
     c = make_client({
-        "asr": {"vocabulary": ["Tailscale", "Claude Code"]},
         "replacements": [
             {"pattern": "hello", "replacement": "Hi"},
             {"pattern": r"world\s+", "replacement": "World! ", "regex": True},
         ],
     })
+    c.state.dictionary.replace({"terms": ["Tailscale", "Claude Code"]})
     r = c.post("/transcribe", data={"prompt": "nanovoice", "clean": "0", "format": "json"},
                files=upload(audio_dir / "speech.wav"))
     assert c.backend.calls[0]["prompt"] == "Tailscale, Claude Code nanovoice"

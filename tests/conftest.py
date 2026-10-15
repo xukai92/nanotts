@@ -8,7 +8,6 @@ import pytest
 from starlette.testclient import TestClient
 
 from nanovoice.config import config_from_dict
-from nanovoice.postprocess import Cleaner
 from nanovoice.server import create_app
 
 TOKEN = "test-token"
@@ -68,21 +67,27 @@ def llm_reply(content: str):
 
 
 @pytest.fixture
-def make_client(monkeypatch):
+def make_client(monkeypatch, tmp_path):
     monkeypatch.setenv("STT_TOKEN", TOKEN)
 
     def _make(overrides: dict | None = None, backend=None, llm=None, auth=True):
-        data = {"llm": {"enabled": True, "min_chars": 5}}
+        data = {
+            "llm": {"enabled": True, "min_chars": 5},
+            "dictionary": {"path": str(tmp_path / "dictionary.toml")},
+            "history": {"path": str(tmp_path / "history.jsonl")},
+        }
         for k, v in (overrides or {}).items():
             data.setdefault(k, {}).update(v) if isinstance(v, dict) else data.__setitem__(k, v)
         cfg = config_from_dict(data)
         backend = backend or FakeBackend()
-        cleaner = Cleaner(cfg.llm, transport=llm_transport(llm or llm_reply("Hello world. 你好世界。")))
-        app = create_app(cfg, backends={"remote": backend}, cleaner=cleaner)
+        transport = llm_transport(llm or llm_reply("Hello world. 你好世界。"))
+        app = create_app(cfg, backends={"remote": backend}, llm_transport=transport)
         client = TestClient(app, raise_server_exceptions=False)
         if auth:
             client.headers["Authorization"] = f"Bearer {TOKEN}"
         client.backend = backend
+        client.cfg = cfg
+        client.state = app.app.state.stt
         return client
 
     return _make

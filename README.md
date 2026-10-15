@@ -12,9 +12,10 @@ iPhone 快捷指令 / stt CLI / OpenWhispr
         │  multipart 上传 (m4a/wav/mp3/ogg/flac/webm)
         ▼
 stt-server ── ffmpeg → 16 kHz 单声道 FLAC + 去静音(VAD)
-        ├── ASR:  POST {asr.remote.base_url}/audio/transcriptions   (词典作为 prompt)
-        ├── 替换规则（字符串 / 正则）
-        └── LLM:  POST {llm.base_url}/chat/completions   (失败自动退回原文)
+        ├── ASR:  POST {asr.remote.base_url}/audio/transcriptions   (词典 terms 作为 prompt)
+        ├── 词典纠错（corrections）→ 替换规则（字符串 / 正则）
+        ├── LLM:  POST {llm.base_url}/chat/completions   (失败自动退回原文)
+        └── 历史记录（可选）→ 自动学习词典
 ```
 
 ## 安装与启动
@@ -103,11 +104,24 @@ stt transcribe note.wav --prompt "Kubernetes, gRPC"
 ffmpeg -i in.mp4 -f wav - | stt transcribe -     # 从 stdin 读
 stt health
 stt --server https://mybox.tail1234.ts.net/stt health
+
+# 词典 / 历史 / 学习（见下文“词典、历史与自动学习”）
+stt dict show                                    # 查看词典
+stt dict add Tailscale "Claude Code"             # 加专有名词
+stt dict fix "tail scale" Tailscale              # 加纠错规则（同时把 Tailscale 加为专有名词）
+stt dict rm MagicDNS                             # 删除专有名词（并且以后不会再被自动学回来）
+stt dict unfix "tail scale"                      # 删除纠错规则
+stt dict edit                                    # 用 $EDITOR 编辑整个词典
+stt history -n 20                                # 最近的转写（带 id）
+stt correct <id> "改正后的完整文本"                # 根据你的改正自动生成纠错规则
+stt learn                                        # 立即从最近的历史学习一次
 ```
 
 服务器地址的优先级：`--server` > `$STT_SERVER` > 配置中的 `[client].server`。token 从 `$STT_TOKEN` 读取。日志和错误信息打印到 stderr；出错时退出码为 1（服务端返回错误）或 2（连不上服务器）。
 
 ## HTTP API
+
+**完整的接口文档由服务自己提供**：浏览器打开 `http://<host>:8765/docs`，是 Swagger UI 交互文档，可以直接试调用，点右上角 Authorize 填 token；机器可读的 OpenAPI 3.1 规范在 `/openapi.json`，可以导入 Postman、Insomnia 或生成客户端。这两个地址都不需要鉴权。下面是摘要。
 
 所有错误都返回 `{"error": {"code": "...", "message": "..."}}`，每个响应都带 `X-Request-ID` 头。
 
@@ -147,7 +161,32 @@ stt --server https://mybox.tail1234.ts.net/stt health
 
 ### `GET /health`
 
-不需要鉴权。返回状态、默认后端和模型、LLM、ffmpeg 版本、鉴权模式和排队情况。
+不需要鉴权。返回状态、默认后端和模型、LLM、ffmpeg 版本、鉴权模式、排队情况、词典条目数，以及历史记录和学习的状态（包括最近一次学习的结果）。
+
+### 词典与历史
+
+| 接口 | 说明 |
+|---|---|
+| `GET /dictionary` | 返回 `{terms, corrections, ignore}` |
+| `PATCH /dictionary` | 按条修改：`{"add_terms": [...], "remove_terms": [...], "add_corrections": [{"wrong", "right"}], "remove_corrections": ["wrong", ...], "ignore_removed": true}` |
+| `PUT /dictionary` | 整份替换（`stt dict edit` 用的就是这个接口） |
+| `GET /history?limit=20` | 最近的转写，最新的在前（需要 `history.enabled`） |
+| `POST /history/{id}/correct` | `{"text": "改正后的文本"}`，自动推出纠错规则并写进词典 |
+| `POST /dictionary/learn` | 立即从最近的历史学习一次 |
+
+`/transcribe` 返回的 JSON 和每个响应的 `X-Request-ID` 头里都有 `id`，也就是这条转写在历史里的 id。
+
+例子：
+
+```bash
+H="Authorization: Bearer $STT_TOKEN"
+curl -H "$H" -X PATCH http://host:8765/dictionary -H 'Content-Type: application/json' \
+     -d '{"add_corrections": [{"wrong": "tail scale", "right": "Tailscale"}]}'
+curl -H "$H" -X POST http://host:8765/history/1ed70d2417d2/correct -H 'Content-Type: application/json' \
+     -d '{"text": "我们明天用 Claude Code 开会吧。"}'
+# → {"added": {"terms": ["Claude Code"], "corrections": [{"wrong": "cloud code", "right": "Claude Code"}]},
+#    "skipped": [...]}
+```
 
 ### 状态码
 
@@ -166,9 +205,43 @@ stt --server https://mybox.tail1234.ts.net/stt health
 
 - **并发**：同一时间最多 `server.max_concurrency` 个 ASR 请求，多出的排队；排队超过 `queue_timeout_s` 返回 503。LLM 清理不占队列位置。
 - **VAD**：用 ffmpeg `silenceremove` 去掉超过 `min_silence_s` 的静音，对所有后端生效。全是静音的录音直接返回空文本，不调用 ASR，也就避免了 Whisper 在静音上“幻听”出文字。
-- **后处理顺序**：ASR（词典作为 prompt）→ 替换规则 → LLM 清理。
+- **后处理顺序**：ASR（词典 terms 作为 prompt）→ 词典纠错 → 替换规则 → LLM 清理。
 - **LLM 清理**：temperature 0；非空白字符少于 `min_chars` 时跳过。下列情况都会退回替换后的原文，请求照常成功：调用失败、超时、返回为空、输出长度异常（超过原文两倍再加 50 个字符，说明模型可能在“回答”而不是清理）。
-- **隐私**：临时文件处理完立即删除；默认不保存音频，日志中不记录转写内容（`server.log_transcripts = false`）。日志是 JSON 行格式，包含解码、排队、ASR、清理各阶段的耗时。
+- **隐私**：临时文件处理完立即删除，任何情况下都不保存音频。转写文本只有在打开 `history.enabled` 时才会写进历史文件（权限 600）；代码里的默认值是关闭，`config.example.toml` 里是打开的。日志里不记录转写内容（`server.log_transcripts = false`）。日志是 JSON 行格式，包含解码、排队、ASR、清理各阶段的耗时。
+
+## 词典、历史与自动学习
+
+### 词典
+
+词典是一个单独的文件（默认 `~/.config/stt/dictionary.toml`，示例见 [`deploy/dictionary.example.toml`](deploy/dictionary.example.toml)），分三部分：
+
+- `terms`：专有名词、人名、产品名、术语。拼接后作为 ASR 的 prompt，让模型倾向于输出这些写法。越靠前优先级越高；总长度超过 `dictionary.max_prompt_chars` 的部分不会发送（Whisper 只看 prompt 的最后约 224 个 token）。
+- `corrections`：`wrong → right`。ASR 输出后做不区分大小写的字面替换，用来修正那些“提示了也还是会认错”的词。英文片段按整词匹配，`cloud` 不会误伤 `icloud`。
+- `ignore`：不允许自动学习加入的词或纠错。
+
+改词典有四种方式，效果一样，都不用重启：
+
+1. **直接编辑文件**：服务会在下一个请求时发现文件变了并重新加载。如果文件写错了（比如 TOML 语法错误），服务会继续用上一个正确的版本，并在日志里报错，不会影响转写。注意：通过 API 或自动学习保存时会重写这个文件，文件里的注释不会保留。
+2. **CLI**：`stt dict add / rm / fix / unfix / edit`（可以在任何一台能访问服务器的机器上用）。
+3. **HTTP API**：`PATCH` / `PUT /dictionary`，见上文。
+4. **改正一条历史转写**：`stt correct <id> "正确的文本"`，或 `POST /history/{id}/correct`。服务把你的版本和当时的结果做 diff，每处被替换的片段生成一条 `wrong → right`，`right` 同时加进 `terms`。为了不误伤，下面这些改动会被跳过并在返回里注明原因：只改了一个字（比如“在 → 再”，做成全局替换太危险）、只改了标点或空格、纯新增或删除的内容，以及 `wrong` 在原始 ASR 输出里根本没出现过的情况。
+
+`stt dict rm` 和 `unfix` 删掉的条目默认会进入 `ignore`，之后自动学习不会再把它加回来（加 `--no-ignore` 可以不这样做）。手动 `add` 或 `fix` 的条目会自动从 `ignore` 里移除。
+
+### 历史记录
+
+`history.enabled = true` 时，每次转写都会在 `~/.local/share/stt/history.jsonl` 追加一行，包括 `id`、时间、原始文本、最终文本、语言、时长和模型。全是静音的录音不会记录。用 `stt history` 或 `GET /history` 查看。文件只会不断追加，不会自动轮转；需要的话可以手动清理或归档。
+
+### 自动学习
+
+`learn.auto = true` 时，每新增 `learn.every` 条历史（默认 20），服务会在后台把最近 `learn.batch` 条（默认 50）转写和当前词典一起发给 LLM（使用 `[llm]` 的接口，模型可以用 `learn.model` 单独指定），让它找出：
+
+- 值得加进词典的专有名词；
+- 固定的识别错误（`wrong → right`）。
+
+LLM 的建议在合并前会先过滤：纠错的 `wrong` 必须在最近的原始转写里逐字出现过，`right` 必须是词典里已有的词或这次新加的词，并且不允许把已有的正确词条改掉；`ignore` 里的条目一律跳过；每次最多新增 `max_new_terms` 个词和 `max_new_corrections` 条纠错。学习在后台进行，不影响转写请求；失败只记日志。也可以随时用 `stt learn` 手动触发并查看学到了什么。
+
+学错了怎么办：`stt dict rm <词>` 或 `stt dict unfix <wrong>`，它们会进入 `ignore`，以后不会再被学回来。
 
 ## 网络与 Tailscale
 
@@ -260,6 +333,10 @@ src/nanovoice/
   config.py        TOML 配置（未知 key 会报错，避免拼写错误被悄悄忽略）
   audio.py         ffmpeg 转码 + VAD
   postprocess.py   词典 prompt、替换规则、LLM 清理
+  dictionary.py    词典文件（热加载、校验、增删改）
+  history.py       转写历史（JSONL）
+  learn.py         自动学习 + 由用户改正推出纠错规则
+  openapi.py       OpenAPI 规范 + /docs 页面
   backends/
     __init__.py    Backend 接口：transcribe(audio_path, language, prompt) -> str
     remote.py      OpenAI 兼容接口

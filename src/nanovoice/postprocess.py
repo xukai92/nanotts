@@ -14,10 +14,17 @@ from .config import LLMConfig, Replacement
 log = logging.getLogger("nanovoice.clean")
 
 
-def build_prompt(vocabulary: list[str], extra: str | None) -> str | None:
+def build_prompt(terms: list[str], extra: str | None, max_chars: int = 600) -> str | None:
+    """Join dictionary terms (in priority order, capped at max_chars) and the per-request prompt."""
     parts = []
-    if vocabulary:
-        parts.append(", ".join(vocabulary))
+    joined = ""
+    for t in terms:
+        candidate = f"{joined}, {t}" if joined else t
+        if len(candidate) > max_chars:
+            break
+        joined = candidate
+    if joined:
+        parts.append(joined)
     if extra and extra.strip():
         parts.append(extra.strip())
     return " ".join(parts) or None
@@ -57,16 +64,29 @@ def _visible_len(text: str) -> int:
     return sum(1 for c in text if not c.isspace())
 
 
+def llm_client(cfg: LLMConfig, timeout_s: float, transport: httpx.BaseTransport | None = None) -> httpx.Client:
+    key = os.environ.get(cfg.api_key_env) if cfg.api_key_env else None
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    return httpx.Client(base_url=cfg.base_url.rstrip("/") + "/", headers=headers, timeout=timeout_s, transport=transport)
+
+
+def chat(client: httpx.Client, model: str, temperature: float, system: str, user: str) -> str:
+    """One OpenAI-compatible chat completion; returns the content with <think> blocks removed."""
+    resp = client.post("chat/completions", json={
+        "model": model,
+        "temperature": temperature,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    })
+    resp.raise_for_status()
+    return _THINK_RE.sub("", resp.json()["choices"][0]["message"]["content"] or "").strip()
+
+
 class Cleaner:
     """LLM cleanup via an OpenAI-compatible chat completions endpoint. Never raises."""
 
     def __init__(self, cfg: LLMConfig, transport: httpx.BaseTransport | None = None):
         self.cfg = cfg
-        key = os.environ.get(cfg.api_key_env) if cfg.api_key_env else None
-        headers = {"Authorization": f"Bearer {key}"} if key else {}
-        self._client = httpx.Client(
-            base_url=cfg.base_url.rstrip("/") + "/", headers=headers, timeout=cfg.timeout_s, transport=transport
-        )
+        self._client = llm_client(cfg, cfg.timeout_s, transport)
 
     @property
     def enabled(self) -> bool:
@@ -78,28 +98,14 @@ class Cleaner:
         if _visible_len(text) < self.cfg.min_chars:
             return CleanResult(text, False, "short")
         try:
-            out = self._complete(text)
+            out = chat(self._client, self.cfg.model, self.cfg.temperature, self.cfg.system_prompt,
+                       self.cfg.user_template.replace("{text}", text))
         except Exception as e:  # any failure falls back to the raw transcript
             log.warning("llm cleanup failed, using raw text", extra={"fields": {"error": f"{type(e).__name__}: {e}"[:300]}})
             return CleanResult(text, False, "error")
-        out = _TAG_RE.sub("", _THINK_RE.sub("", out)).strip()
+        out = _TAG_RE.sub("", out).strip()
         # Guard against the model answering / expanding instead of cleaning.
         if not out or len(out) > 2 * len(text) + 50:
             log.warning("llm output rejected, using raw text", extra={"fields": {"in_chars": len(text), "out_chars": len(out)}})
             return CleanResult(text, False, "rejected")
         return CleanResult(out, True)
-
-    def _complete(self, text: str) -> str:
-        resp = self._client.post(
-            "chat/completions",
-            json={
-                "model": self.cfg.model,
-                "temperature": self.cfg.temperature,
-                "messages": [
-                    {"role": "system", "content": self.cfg.system_prompt},
-                    {"role": "user", "content": self.cfg.user_template.replace("{text}", text)},
-                ],
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"] or ""

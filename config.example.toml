@@ -45,8 +45,7 @@ decode_timeout_s = 30
 backend = "remote"
 # 默认语言："auto" = 自动检测（适合中英混杂）；也可以填 "zh"、"en" 等，按请求覆盖
 language = "auto"
-# 专有名词词典：拼接后作为 ASR 的 prompt 传入，提高识别准确率
-vocabulary = ["Tailscale", "Claude Code", "MagicDNS"]
+# 专有名词和纠错词典放在单独的文件里，见下面的 [dictionary]
 
 [asr.remote]
 # 任何 OpenAI 兼容的 /v1/audio/transcriptions 接口
@@ -60,7 +59,36 @@ timeout_s = 30
 [asr.local]
 model = "large-v3-turbo"
 
-# 替换规则，按顺序执行，在 LLM 清理之前。用于固定纠错和 snippets。
+[dictionary]
+# 专有名词 + 纠错词典（单独文件，修改后自动生效，无需重启）。
+#   terms       拼接后作为 ASR 的 prompt 传入，提高识别准确率（越靠前优先级越高）
+#   corrections ASR 之后做的不区分大小写的字面替换，例如 "tail scale" -> "Tailscale"
+#   ignore      不希望被自动学习加入的词
+# 可以手动编辑，也可以用 `stt dict ...`、HTTP API 或自动学习来修改。示例见 deploy/dictionary.example.toml
+path = "~/.config/stt/dictionary.toml"
+# 发给 ASR 的词典部分最多多少字符（Whisper 只看 prompt 的最后约 224 个 token）
+max_prompt_chars = 600
+
+[history]
+# 把每次转写的文本（原始 + 最终）追加到 JSONL 文件，不保存音频。
+# 用于 `stt history`、对历史转写纠错（`stt correct`），以及自动学习词典。
+enabled = true
+path = "~/.local/share/stt/history.jsonl"
+
+[learn]
+# 自动学习：每新增 every 条历史，就在后台把最近 batch 条发给 LLM，提取专有名词和固定识别错误，合并进词典。
+# 使用 [llm] 的 base_url / key（不要求 llm.enabled）；model 留空表示使用 llm.model。
+# 也可以随时用 `stt learn` 手动触发。学错的词用 `stt dict rm` 删除，之后不会再被学回来。
+auto = true
+every = 20
+batch = 50
+model = ""
+timeout_s = 60
+max_new_terms = 20
+max_new_corrections = 10
+# prompt = """..."""   # 学习用的 system prompt，默认值见 src/nanovoice/config.py 中的 DEFAULT_LEARN_PROMPT
+
+# 替换规则，按顺序执行，在词典纠错之后、LLM 清理之前。用于正则纠错和 snippets。
 # regex = true 时 pattern 是正则，replacement 可以用 \1 引用分组。
 [[replacements]]
 pattern = "cloud code"

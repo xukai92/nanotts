@@ -25,14 +25,18 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 from . import __version__
 from .audio import AudioError, ffmpeg_version, prepare
 from .backends import BACKEND_NAMES, Backend, BackendError, BackendTimeout, BackendUnavailable, create_backend
 from .config import Config, ConfigError, load_config
+from .dictionary import Dictionary, DictionaryError
+from .history import History
+from .learn import LearnBusy, LearnError, Learner, corrections_from_edit
 from .log import setup_logging
+from .openapi import DOCS_HTML, spec
 from .postprocess import Cleaner, Replacer, build_prompt
 
 log = logging.getLogger("nanovoice")
@@ -68,11 +72,12 @@ class Gateway:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        bp, path = self.base_path, scope["path"]
+        bp, path, prefix = self.base_path, scope["path"], ""
         if bp and (path == bp or path.startswith(bp + "/")):
             scope = {**scope, "path": path[len(bp):] or "/"}
+            prefix = bp
         rid = uuid.uuid4().hex[:12]
-        scope.setdefault("state", {})["request_id"] = rid
+        scope.setdefault("state", {}).update(request_id=rid, prefix=prefix)
         start, status = time.perf_counter(), 500
 
         async def send_wrapper(message):
@@ -113,6 +118,7 @@ class Gateway:
 
 @dataclass
 class Result:
+    id: str
     text: str
     raw_text: str
     language: str | None
@@ -124,19 +130,22 @@ class Result:
 
     def as_dict(self) -> dict:
         return {
-            "text": self.text, "raw_text": self.raw_text, "language": self.language,
+            "id": self.id, "text": self.text, "raw_text": self.raw_text, "language": self.language,
             "duration_ms": self.duration_ms, "backend": self.backend, "model": self.model,
             "cleaned": self.cleaned, "timings": self.timings,
         }
 
 
 class AppState:
-    def __init__(self, cfg: Config, backends: dict[str, Backend] | None, cleaner: Cleaner | None):
+    def __init__(self, cfg: Config, backends: dict[str, Backend] | None, llm_transport=None):
         self.cfg = cfg
         self.backends: dict[str, Backend] = dict(backends or {})
         self._backend_lock = threading.Lock()
-        self.cleaner = cleaner or Cleaner(cfg.llm)
+        self.cleaner = Cleaner(cfg.llm, transport=llm_transport)
         self.replacer = Replacer(cfg.replacements)
+        self.dictionary = Dictionary(cfg.dictionary.path)
+        self.history = History(cfg.history.path) if cfg.history.enabled else None
+        self.learner = Learner(cfg, self.dictionary, self.history, llm_transport) if self.history else None
         self.slots = threading.BoundedSemaphore(cfg.server.max_concurrency)
         self.in_flight = 0
         self.token = os.environ.get(cfg.auth.token_env, "") if cfg.auth.mode == "token" else ""
@@ -220,7 +229,7 @@ async def run_pipeline(request: Request, state: AppState, upload: UploadFile, *,
     t_total = time.perf_counter()
     timings: dict = {"decode_ms": 0, "queue_ms": 0, "asr_ms": 0, "clean_ms": 0}
     backend = state.backend(backend_name)
-    asr_prompt = build_prompt(cfg.asr.vocabulary, prompt)
+    asr_prompt = build_prompt(state.dictionary.prompt_terms(), prompt, cfg.dictionary.max_prompt_chars)
 
     with tempfile.TemporaryDirectory(prefix="stt-") as tmp:
         src = Path(tmp) / ("input" + _safe_suffix(upload.filename))
@@ -252,7 +261,7 @@ async def run_pipeline(request: Request, state: AppState, upload: UploadFile, *,
             except BackendError as e:
                 raise ApiError(502, "asr_failed", str(e)) from e
 
-    text = state.replacer.apply(raw)
+    text = state.replacer.apply(state.dictionary.apply(raw))
     cleaned, skipped = False, None
     if clean and text:
         t = time.perf_counter()
@@ -270,8 +279,17 @@ async def run_pipeline(request: Request, state: AppState, upload: UploadFile, *,
     if cfg.server.log_transcripts:
         fields.update(raw_text=raw, text=text)
     log.info("transcribed", extra={"fields": fields})
-    return Result(text=text, raw_text=raw, language=language, duration_ms=audio.input_ms,
-                  backend=backend.name, model=backend.model, cleaned=cleaned, timings=timings)
+    result = Result(id=request.state.request_id, text=text, raw_text=raw, language=language, duration_ms=audio.input_ms,
+                    backend=backend.name, model=backend.model, cleaned=cleaned, timings=timings)
+    if state.history and raw:
+        entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "endpoint": endpoint,
+                 **{k: v for k, v in result.as_dict().items() if k != "timings"}}
+        try:
+            await run_in_threadpool(state.history.append, entry)
+            state.learner.note_entry()
+        except OSError as e:  # never fail a transcription because the history file is unwritable
+            log.error("could not write history", extra={"fields": {"error": str(e)}})
+    return result
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -314,7 +332,102 @@ async def health(request: Request) -> Response:
         "ffmpeg": state.ffmpeg,
         "auth": cfg.auth.mode,
         "queue": {"max_concurrency": cfg.server.max_concurrency, "in_flight": state.in_flight},
+        "dictionary": {"path": str(state.dictionary.path), **state.dictionary.counts()},
+        "history": {"enabled": bool(state.history), "auto_learn": bool(state.learner and cfg.learn.auto),
+                    "last_learn": state.learner.last_run if state.learner else None},
     })
+
+
+async def openapi_json(request: Request) -> Response:
+    return JSONResponse(spec(request.state.prefix or "/"))
+
+
+async def docs(request: Request) -> Response:
+    return HTMLResponse(DOCS_HTML)
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ApiError(400, "invalid_json", f"request body must be JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise ApiError(400, "invalid_json", "request body must be a JSON object")
+    return body
+
+
+async def dictionary(request: Request) -> Response:
+    state: AppState = request.app.state.stt
+    check_auth(request, state)
+    d = state.dictionary
+    try:
+        if request.method == "GET":
+            return JSONResponse(await run_in_threadpool(d.snapshot))
+        body = await _json_body(request)
+        if request.method == "PUT":
+            return JSONResponse(await run_in_threadpool(d.replace, body))
+        allowed = {"add_terms", "remove_terms", "add_corrections", "remove_corrections", "ignore_removed"}
+        if unknown := set(body) - allowed:
+            raise ApiError(400, "invalid_parameter", f"unknown field(s): {', '.join(sorted(unknown))}")
+        ignore_removed = body.get("ignore_removed", True)
+        if not isinstance(ignore_removed, bool):
+            raise ApiError(400, "invalid_parameter", "ignore_removed must be a boolean")
+        return JSONResponse(await run_in_threadpool(lambda: d.patch(
+            add_terms=body.get("add_terms") or [], remove_terms=body.get("remove_terms") or [],
+            add_corrections=body.get("add_corrections") or [], remove_corrections=body.get("remove_corrections") or [],
+            ignore_removed=ignore_removed)))
+    except DictionaryError as e:
+        raise ApiError(400, "invalid_dictionary", str(e)) from e
+
+
+def _require_history(state: AppState) -> History:
+    if not state.history:
+        raise ApiError(400, "history_disabled", "set history.enabled = true in the config to use this")
+    return state.history
+
+
+async def learn(request: Request) -> Response:
+    state: AppState = request.app.state.stt
+    check_auth(request, state)
+    _require_history(state)
+    try:
+        return JSONResponse(await run_in_threadpool(state.learner.run))
+    except LearnBusy as e:
+        raise ApiError(409, "learn_running", str(e)) from e
+    except LearnError as e:
+        raise ApiError(502, "learn_failed", str(e)) from e
+
+
+async def history(request: Request) -> Response:
+    state: AppState = request.app.state.stt
+    check_auth(request, state)
+    hist = _require_history(state)
+    try:
+        limit = int(request.query_params.get("limit", "20"))
+    except ValueError:
+        limit = -1
+    if not 1 <= limit <= 1000:
+        raise ApiError(400, "invalid_parameter", "limit must be an integer between 1 and 1000")
+    entries = await run_in_threadpool(hist.tail, limit)
+    return JSONResponse({"entries": entries[::-1]})
+
+
+async def correct_history(request: Request) -> Response:
+    """The user fixed a transcript: derive dictionary corrections from the difference."""
+    state: AppState = request.app.state.stt
+    check_auth(request, state)
+    hist = _require_history(state)
+    body = await _json_body(request)
+    corrected = body.get("text")
+    if not isinstance(corrected, str) or not corrected.strip():
+        raise ApiError(400, "invalid_parameter", "'text' (the corrected transcript) is required")
+    entry = await run_in_threadpool(hist.find, request.path_params["entry_id"])
+    if not entry:
+        raise ApiError(404, "not_found", "no history entry with that id")
+    terms, corrections, skipped = corrections_from_edit(entry.get("text", ""), corrected, entry.get("raw_text", ""))
+    if terms or corrections:
+        await run_in_threadpool(lambda: state.dictionary.patch(add_terms=terms, add_corrections=corrections))
+    return JSONResponse({"added": {"terms": terms, "corrections": corrections}, "skipped": skipped})
 
 
 async def transcribe(request: Request) -> Response:
@@ -399,15 +512,21 @@ async def _internal_error(request: Request, exc: Exception) -> Response:
     return error_response(500, "internal_error", "internal server error")
 
 
-def create_app(cfg: Config, backends: dict[str, Backend] | None = None, cleaner: Cleaner | None = None):
-    """Build the ASGI app. `backends`/`cleaner` let tests inject fakes."""
-    state = AppState(cfg, backends, cleaner)
+def create_app(cfg: Config, backends: dict[str, Backend] | None = None, llm_transport=None):
+    """Build the ASGI app. `backends` / `llm_transport` let tests inject fakes."""
+    state = AppState(cfg, backends, llm_transport)
     state.backend(cfg.asr.backend)  # instantiate the default backend once, at startup
     app = Starlette(
         routes=[
             Route("/health", health, methods=["GET"]),
             Route("/transcribe", transcribe, methods=["POST"]),
             Route("/v1/audio/transcriptions", openai_transcriptions, methods=["POST"]),
+            Route("/dictionary", dictionary, methods=["GET", "PUT", "PATCH"]),
+            Route("/dictionary/learn", learn, methods=["POST"]),
+            Route("/history", history, methods=["GET"]),
+            Route("/history/{entry_id}/correct", correct_history, methods=["POST"]),
+            Route("/openapi.json", openapi_json, methods=["GET"]),
+            Route("/docs", docs, methods=["GET"]),
         ],
         exception_handlers={
             ApiError: _api_error, BodyTooLarge: _too_large, HTTPException: _http_error, Exception: _internal_error,
