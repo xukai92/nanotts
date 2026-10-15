@@ -324,6 +324,35 @@ uv sync
 uv run pytest          # 测试需要 ffmpeg；ASR 和 LLM 用 fake 或 mock 实现，不访问网络
 ```
 
+本地用真实 OpenAI 调试的最短配置（一个 key 同时给 ASR 和 LLM 用）：
+
+```toml
+# debug.toml
+[server]
+host = "127.0.0.1"
+log_level = "debug"
+[auth]
+mode = "none"
+[asr.remote]
+model = "whisper-1"              # 或 gpt-4o-transcribe / gpt-4o-mini-transcribe
+api_key_env = "OPENAI_API_KEY"
+[llm]
+enabled = true
+model = "gpt-6-luna"
+api_key_env = "OPENAI_API_KEY"
+[history]
+enabled = true
+[client]
+server = "http://127.0.0.1:8765"
+```
+
+```bash
+export OPENAI_API_KEY=sk-...
+uv run stt-server --config debug.toml
+uv run stt --config debug.toml transcribe some.m4a --json     # 另一个终端
+open http://127.0.0.1:8765/docs                               # 交互式 API 文档
+```
+
 代码结构：
 
 ```

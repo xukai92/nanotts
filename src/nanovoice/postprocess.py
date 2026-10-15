@@ -96,10 +96,6 @@ class Cleaner:
         self.cfg = cfg
         self._client = llm_client(cfg, cfg.timeout_s, transport)
 
-    @property
-    def enabled(self) -> bool:
-        return self.cfg.enabled
-
     def clean(self, text: str) -> CleanResult:
         if not self.cfg.enabled:
             return CleanResult(text, False, "disabled")

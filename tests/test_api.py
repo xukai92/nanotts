@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
-from starlette.testclient import TestClient
 
 from conftest import FakeBackend, llm_reply, upload
 from nanovoice.backends import BackendError, BackendTimeout

@@ -147,6 +147,7 @@ class AppState:
         self.history = History(cfg.history.path) if cfg.history.enabled else None
         self.learner = Learner(cfg, self.dictionary, self.history, llm_transport) if self.history else None
         self.slots = threading.BoundedSemaphore(cfg.server.max_concurrency)
+        self._in_flight_lock = threading.Lock()
         self.in_flight = 0
         self.token = os.environ.get(cfg.auth.token_env, "") if cfg.auth.mode == "token" else ""
         self.tailscale_users = {u.lower() for u in cfg.auth.tailscale_users}
@@ -172,13 +173,15 @@ class AppState:
         if not self.slots.acquire(timeout=self.cfg.server.queue_timeout_s):
             raise ApiError(503, "busy", "server is busy, try again later")
         timings["queue_ms"] = _ms_since(t)
-        self.in_flight += 1
+        with self._in_flight_lock:
+            self.in_flight += 1
         try:
             t = time.perf_counter()
             return backend.transcribe(path, language, prompt)
         finally:
             timings["asr_ms"] = _ms_since(t)
-            self.in_flight -= 1
+            with self._in_flight_lock:
+                self.in_flight -= 1
             self.slots.release()
 
 
@@ -210,8 +213,6 @@ def _norm_language(value) -> str | None:
 async def _read_form(request: Request, state: AppState):
     try:
         form = await request.form(max_files=2, max_fields=32)
-    except BodyTooLarge:
-        raise
     except HTTPException as e:
         raise ApiError(400, "invalid_request", f"could not parse form data: {e.detail}") from e
     upload = form.get("file")
