@@ -112,3 +112,22 @@ def test_example_config_loads():
     assert path is not None
     assert cfg.asr.backend == "remote"
     Replacer(cfg.replacements)  # all example rules compile
+
+
+def test_chat_retries_without_rejected_temperature():
+    from nanovoice.postprocess import _NO_TEMPERATURE, chat
+    bodies = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        bodies.append(body)
+        if "temperature" in body:
+            return httpx.Response(400, json={"error": {"message": "Unsupported value: 'temperature' does not support 0"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = httpx.Client(base_url="http://llm/", transport=httpx.MockTransport(handler))
+    _NO_TEMPERATURE.discard("reasoner")
+    assert chat(client, "reasoner", 0.0, "s", "u") == "ok"
+    assert chat(client, "reasoner", 0.0, "s", "u") == "ok"  # remembered: no second 400
+    assert ["temperature" in b for b in bodies] == [True, False, False]
+    _NO_TEMPERATURE.discard("reasoner")

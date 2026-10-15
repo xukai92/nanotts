@@ -106,12 +106,13 @@ regex = true
 
 [llm]
 # LLM 清理：去口头禅、去重复、修标点。失败或超时自动退回原始转写。
-enabled = false
+enabled = true
 # 任何 OpenAI 兼容的 /v1/chat/completions 接口
 base_url = "https://api.openai.com/v1"
-model = "gpt-4o-mini"
+model = "gpt-6-luna"
 api_key_env = "STT_LLM_API_KEY"
 timeout_s = 15
+# 如果模型不接受 temperature 参数（部分推理模型只支持默认值），会自动去掉该参数重试
 temperature = 0.0
 # 非空白字符数少于这个值时跳过清理
 min_chars = 10

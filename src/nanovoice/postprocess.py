@@ -70,13 +70,21 @@ def llm_client(cfg: LLMConfig, timeout_s: float, transport: httpx.BaseTransport 
     return httpx.Client(base_url=cfg.base_url.rstrip("/") + "/", headers=headers, timeout=timeout_s, transport=transport)
 
 
+# Models that rejected the `temperature` parameter (some reasoning models only accept the default).
+_NO_TEMPERATURE: set[str] = set()
+
+
 def chat(client: httpx.Client, model: str, temperature: float, system: str, user: str) -> str:
     """One OpenAI-compatible chat completion; returns the content with <think> blocks removed."""
-    resp = client.post("chat/completions", json={
-        "model": model,
-        "temperature": temperature,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-    })
+    body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if model not in _NO_TEMPERATURE:
+        body["temperature"] = temperature
+    resp = client.post("chat/completions", json=body)
+    if resp.status_code == 400 and "temperature" in body and "temperature" in resp.text:
+        log.info("model rejected temperature, retrying without it", extra={"fields": {"model": model}})
+        _NO_TEMPERATURE.add(model)
+        del body["temperature"]
+        resp = client.post("chat/completions", json=body)
     resp.raise_for_status()
     return _THINK_RE.sub("", resp.json()["choices"][0]["message"]["content"] or "").strip()
 
