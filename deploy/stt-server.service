@@ -1,0 +1,19 @@
+# systemd user service (Linux)
+#   cp deploy/stt-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now stt-server
+#   loginctl enable-linger "$USER"     # keep running after logout / start at boot
+#   journalctl --user -u stt-server -f
+[Unit]
+Description=nanovoice speech-to-text server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Secrets (STT_TOKEN, STT_ASR_API_KEY, STT_LLM_API_KEY) live here, chmod 600.
+EnvironmentFile=%h/.config/stt/env
+ExecStart=%h/.local/bin/stt-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

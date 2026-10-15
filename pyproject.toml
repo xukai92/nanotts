@@ -1,0 +1,27 @@
+[project]
+name = "nanovoice"
+version = "0.1.0"
+description = "Self-hosted speech-to-text HTTP service and CLI (OpenAI-compatible backends)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+stt-server = "nanovoice.server:main"
+stt = "nanovoice.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`"]
